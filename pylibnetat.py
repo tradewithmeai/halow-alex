@@ -2,12 +2,15 @@
 """
 AT Command Configuration Tool for Taixin TX-AH-R WiFi HaLow Modules
 ====================================================================
-This tool enables communication with WiFi HaLow modules using AT commands
-over UDP broadcast protocol. It provides a command-line interface for
-sending AT commands and receiving responses from the modules.
+This tool enables communication with WiFi HaLow (802.11ah) modules using AT commands
+over UDP broadcast protocol. It provides a command-line interface for configuring
+and controlling HaLow modules.
+
+Based on the manufacturer's protocol specification for network-based AT command tools.
 
 Author: pylibnetat contributors
 License: See LICENSE file
+Version: 4.0
 """
 
 import socket
@@ -19,21 +22,32 @@ import sys
 import platform
 import argparse
 import logging
-from typing import Optional, Tuple, Union
+import json
+import os
+import threading
+import queue
+import binascii
+from typing import Optional, Tuple, Union, Dict, List, Any
+from datetime import datetime
+from enum import IntEnum
 
 # ============================================================================
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
 # Network configuration
-NETAT_BUFF_SIZE = 1024  # Buffer size for receiving data
+NETAT_BUFF_SIZE = 2048  # Increased buffer for larger responses
 NETAT_PORT = 56789      # UDP port for AT command communication
 
 # Protocol command identifiers
-WNB_NETAT_CMD_SCAN_REQ = 1   # Request to scan for devices
-WNB_NETAT_CMD_SCAN_RESP = 2  # Response from device scan
-WNB_NETAT_CMD_AT_REQ = 3     # AT command request
-WNB_NETAT_CMD_AT_RESP = 4    # AT command response
+class WnbCommand(IntEnum):
+    """WiFi HaLow Network Bridge Protocol Commands"""
+    SCAN_REQ = 1   # Request to scan for devices
+    SCAN_RESP = 2  # Response from device scan
+    AT_REQ = 3     # AT command request
+    AT_RESP = 4    # AT command response
+    DATA_REQ = 5   # Data transmission request
+    DATA_RESP = 6  # Data transmission response
 
 # MAC address formatting helpers
 MAC2STR = lambda a: (a[0] & 0xff, a[1] & 0xff, a[2] & 0xff, 
@@ -43,21 +57,75 @@ MACSTR = "%02x:%02x:%02x:%02x:%02x:%02x"
 # Platform-specific socket options
 SO_BINDTODEVICE = 25  # Linux socket option for binding to specific interface
 
+# AT Command termination characters
+AT_TERMINATOR = "\r\n"  # CR+LF as per documentation
+
 # ============================================================================
 # LOGGING CONFIGURATION
 # ============================================================================
 
-def setup_logging(debug: bool = False):
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter with colors for terminal output"""
+    
+    COLORS = {
+        'DEBUG': '\033[36m',    # Cyan
+        'INFO': '\033[32m',     # Green
+        'WARNING': '\033[33m',  # Yellow
+        'ERROR': '\033[31m',    # Red
+        'CRITICAL': '\033[35m', # Magenta
+        'PACKET': '\033[34m',   # Blue
+        'RESET': '\033[0m'      # Reset
+    }
+    
+    def format(self, record):
+        if hasattr(record, 'packet'):
+            record.levelname = 'PACKET'
+        color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
+        record.levelname = f"{color}{record.levelname}{self.COLORS['RESET']}"
+        return super().format(record)
+
+def setup_logging(debug: bool = False, verbose: bool = False):
     """
-    Configure logging based on debug flag.
+    Configure logging based on debug and verbose flags.
     
     Args:
-        debug: If True, sets logging level to DEBUG, otherwise INFO
+        debug: If True, sets logging level to DEBUG
+        verbose: If True, enables packet-level logging
     """
     level = logging.DEBUG if debug else logging.INFO
-    format_str = '%(asctime)s - %(levelname)s - %(funcName)s - %(message)s'
-    logging.basicConfig(level=level, format=format_str)
-    return logging.getLogger(__name__)
+    
+    # Create logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(level)
+    
+    # Clear existing handlers
+    logger.handlers = []
+    
+    # Create console handler
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+    
+    # Set formatter
+    if sys.stdout.isatty():  # Use colors if terminal
+        formatter = ColoredFormatter(
+            '%(asctime)s - %(levelname)s - %(funcName)s - %(message)s',
+            datefmt='%H:%M:%S'
+        )
+    else:
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(funcName)s - %(message)s'
+        )
+    
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    # Add packet logger if verbose
+    if verbose:
+        logger.packet = lambda msg: logger.log(35, msg, extra={'packet': True})
+    else:
+        logger.packet = lambda msg: None
+    
+    return logger
 
 logger = setup_logging()
 
@@ -75,24 +143,109 @@ class WnbNetatCmd:
     - dest (6 bytes): Destination MAC address
     - src (6 bytes): Source MAC address
     - data (variable): Command data payload
+    
+    Total header size: 15 bytes
     """
+    
+    HEADER_SIZE = 15
     
     def __init__(self):
         self.cmd = 0
-        self.len = b'\x00\x00'
+        self.len = 0
         self.dest = b'\x00\x00\x00\x00\x00\x00'
         self.src = b'\x00\x00\x00\x00\x00\x00'
         self.data = b''
     
     def __bytes__(self):
         """Convert command to bytes for transmission."""
-        return bytes([self.cmd]) + self.len + self.dest + self.src + self.data
+        len_bytes = struct.pack('>H', len(self.data))
+        return bytes([self.cmd]) + len_bytes + self.dest + self.src + self.data
+    
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        """Parse packet from bytes."""
+        if len(data) < cls.HEADER_SIZE:
+            return None
+        
+        cmd = cls()
+        cmd.cmd = data[0]
+        cmd.len = struct.unpack('>H', data[1:3])[0]
+        cmd.dest = data[3:9]
+        cmd.src = data[9:15]
+        cmd.data = data[15:15+cmd.len] if len(data) >= 15+cmd.len else data[15:]
+        return cmd
     
     def __str__(self):
         """String representation for debugging."""
-        return (f"WnbNetatCmd(cmd={self.cmd}, len={struct.unpack('>H', self.len)[0]}, "
+        cmd_name = WnbCommand(self.cmd).name if self.cmd in WnbCommand.__members__.values() else f"UNKNOWN({self.cmd})"
+        return (f"WnbNetatCmd(cmd={cmd_name}, len={len(self.data)}, "
                 f"dest={self.dest.hex()}, src={self.src.hex()}, "
-                f"data={self.data[:20]}{'...' if len(self.data) > 20 else ''})")
+                f"data={self.data[:50]}{'...' if len(self.data) > 50 else ''})")
+    
+    def to_hex_dump(self):
+        """Generate detailed hex dump for packet analysis."""
+        packet = bytes(self)
+        lines = []
+        lines.append("=" * 60)
+        lines.append(f"Packet Analysis (Total: {len(packet)} bytes)")
+        lines.append("=" * 60)
+        lines.append(f"CMD:  0x{self.cmd:02x} ({WnbCommand(self.cmd).name if self.cmd in WnbCommand.__members__.values() else 'UNKNOWN'})")
+        lines.append(f"LEN:  0x{struct.pack('>H', len(self.data)).hex()} ({len(self.data)} bytes)")
+        lines.append(f"DEST: {self.dest.hex()} ({':'.join(f'{b:02x}' for b in self.dest)})")
+        lines.append(f"SRC:  {self.src.hex()} ({':'.join(f'{b:02x}' for b in self.src)})")
+        
+        if self.data:
+            lines.append(f"\nDATA ({len(self.data)} bytes):")
+            # Hex dump of data
+            for i in range(0, len(self.data), 16):
+                chunk = self.data[i:i+16]
+                hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                lines.append(f"  {i:04x}: {hex_str:<48} |{ascii_str}|")
+            
+            # Try to decode as string
+            try:
+                decoded = self.data.decode('utf-8', errors='ignore').strip()
+                if decoded:
+                    lines.append(f"\nDecoded: {decoded}")
+            except:
+                pass
+        
+        lines.append("=" * 60)
+        return '\n'.join(lines)
+
+
+class EthernetFrame:
+    """
+    Ethernet frame header for 1-to-many mode data transmission.
+    
+    Frame format (14 bytes):
+    - Destination MAC (6 bytes)
+    - Source MAC (6 bytes)
+    - Protocol Type (2 bytes)
+    """
+    
+    HEADER_SIZE = 14
+    
+    def __init__(self, dest_mac: bytes = None, src_mac: bytes = None, proto: int = 0x9999):
+        self.dest_mac = dest_mac or b'\xff\xff\xff\xff\xff\xff'  # Broadcast by default
+        self.src_mac = src_mac or b'\x00\x00\x00\x00\x00\x00'    # Zero by default
+        self.proto = proto
+    
+    def __bytes__(self):
+        """Convert to bytes."""
+        return self.dest_mac + self.src_mac + struct.pack('>H', self.proto)
+    
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        """Parse from bytes."""
+        if len(data) < cls.HEADER_SIZE:
+            return None
+        frame = cls()
+        frame.dest_mac = data[0:6]
+        frame.src_mac = data[6:12]
+        frame.proto = struct.unpack('>H', data[12:14])[0]
+        return frame
 
 
 class NetatMgr:
@@ -103,19 +256,54 @@ class NetatMgr:
         sock: UDP socket for communication
         dest: Destination MAC address (default: broadcast)
         cookie: Random identifier for matching requests/responses
-        recvbuf: Buffer for receiving data
         interface: Network interface name
         debug: Debug mode flag
+        verbose: Verbose packet logging
+        packet_capture: Enable packet capture to file
+        device_map: Mapping of device IDs to MAC addresses
     """
     
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, verbose: bool = False):
         self.sock = None
         self.dest = b'\xff\xff\xff\xff\xff\xff'  # Broadcast MAC
         self.cookie = b'\x00\x00\x00\x00\x00\x00'
-        self.recvbuf = bytearray(NETAT_BUFF_SIZE)
         self.interface = None
         self.debug = debug
-        self.bind_method = None  # Track which binding method worked
+        self.verbose = verbose
+        self.bind_method = None
+        self.packet_capture = None
+        self.device_map = {}  # Device ID to MAC mapping for 1-to-many mode
+        self.response_queue = queue.Queue()
+        self.sniffer_thread = None
+        self.running = False
+        self.last_response = None
+        self.mode = 'one-to-one'  # Default mode
+    
+    def start_packet_capture(self, filename: str):
+        """Start capturing packets to file."""
+        self.packet_capture = open(filename, 'ab')
+        logger.info(f"Started packet capture to {filename}")
+    
+    def stop_packet_capture(self):
+        """Stop packet capture."""
+        if self.packet_capture:
+            self.packet_capture.close()
+            self.packet_capture = None
+            logger.info("Stopped packet capture")
+    
+    def capture_packet(self, direction: str, data: bytes, addr: tuple = None):
+        """Capture packet to file if enabled."""
+        if self.packet_capture:
+            timestamp = datetime.now().isoformat()
+            entry = {
+                'timestamp': timestamp,
+                'direction': direction,
+                'addr': str(addr) if addr else None,
+                'data': binascii.hexlify(data).decode(),
+                'size': len(data)
+            }
+            self.packet_capture.write(json.dumps(entry).encode() + b'\n')
+            self.packet_capture.flush()
 
 # Global instance
 libnetat = None
@@ -125,25 +313,18 @@ libnetat = None
 # ============================================================================
 
 def random_bytes(length: int) -> bytes:
-    """
-    Generate random bytes for use as cookies/identifiers.
-    
-    Args:
-        length: Number of random bytes to generate
-    
-    Returns:
-        Bytes object with random values
-    """
+    """Generate random bytes for use as cookies/identifiers."""
     return bytes([random.randint(0, 255) for _ in range(length)])
 
 
+def mac_str_to_bytes(mac_str: str) -> bytes:
+    """Convert MAC address string to bytes."""
+    parts = mac_str.replace(':', '').replace('-', '')
+    return bytes.fromhex(parts)
+
+
 def get_platform_info() -> dict:
-    """
-    Get detailed platform information for debugging.
-    
-    Returns:
-        Dictionary containing platform details
-    """
+    """Get detailed platform information for debugging."""
     return {
         'system': platform.system(),
         'release': platform.release(),
@@ -185,24 +366,38 @@ def list_network_interfaces():
 # SOCKET OPERATIONS
 # ============================================================================
 
-def sock_send(sock: socket.socket, data: bytes) -> int:
+def sock_send(sock: socket.socket, data: bytes, addr: tuple = None) -> int:
     """
-    Send data via UDP broadcast.
+    Send data via UDP.
     
     Args:
         sock: UDP socket to send through
         data: Bytes to send
+        addr: Optional specific address, otherwise broadcast
     
     Returns:
         Number of bytes sent
     """
-    dest = ('<broadcast>', NETAT_PORT)
+    global libnetat
+    
+    dest = addr or ('<broadcast>', NETAT_PORT)
     logger.debug(f"Sending {len(data)} bytes to {dest}")
-    logger.debug(f"Data hex: {data.hex()}")
+    
+    if libnetat and libnetat.verbose:
+        cmd = WnbNetatCmd.from_bytes(data)
+        if cmd:
+            logger.packet(f"TX Packet:\n{cmd.to_hex_dump()}")
+        else:
+            logger.packet(f"TX Raw ({len(data)} bytes): {data.hex()}")
     
     try:
         sent = sock.sendto(data, dest)
         logger.debug(f"Successfully sent {sent} bytes")
+        
+        # Capture packet
+        if libnetat:
+            libnetat.capture_packet('TX', data, dest)
+        
         return sent
     except Exception as e:
         logger.error(f"Failed to send data: {e}")
@@ -220,6 +415,8 @@ def sock_recv(sock: socket.socket, timeout: float) -> Tuple[Optional[bytes], Opt
     Returns:
         Tuple of (data, address) or (None, None) on timeout
     """
+    global libnetat
+    
     logger.debug(f"Waiting for data with timeout={timeout}s")
     
     try:
@@ -227,7 +424,18 @@ def sock_recv(sock: socket.socket, timeout: float) -> Tuple[Optional[bytes], Opt
         if sock in rlist:
             data, addr = sock.recvfrom(NETAT_BUFF_SIZE)
             logger.debug(f"Received {len(data)} bytes from {addr}")
-            logger.debug(f"Data hex: {data.hex()[:100]}...")
+            
+            if libnetat and libnetat.verbose:
+                cmd = WnbNetatCmd.from_bytes(data)
+                if cmd:
+                    logger.packet(f"RX Packet from {addr}:\n{cmd.to_hex_dump()}")
+                else:
+                    logger.packet(f"RX Raw ({len(data)} bytes): {data.hex()}")
+            
+            # Capture packet
+            if libnetat:
+                libnetat.capture_packet('RX', data, addr)
+            
             return data, addr
     except Exception as e:
         logger.error(f"Error receiving data: {e}")
@@ -240,26 +448,22 @@ def sock_recv(sock: socket.socket, timeout: float) -> Tuple[Optional[bytes], Opt
 # ============================================================================
 
 def netat_scan():
-    """
-    Send a broadcast scan request to discover HaLow devices.
-    
-    This function broadcasts a scan request packet with a random cookie
-    identifier. Devices should respond with their MAC address.
-    """
+    """Send a broadcast scan request to discover HaLow devices."""
     global libnetat
     logger.info("Scanning for HaLow devices...")
     
     scan = WnbNetatCmd()
     libnetat.cookie = random_bytes(6)
-    scan.cmd = WNB_NETAT_CMD_SCAN_REQ
+    scan.cmd = WnbCommand.SCAN_REQ
     scan.dest = b'\xff\xff\xff\xff\xff\xff'  # Broadcast to all
     scan.src = libnetat.cookie
+    scan.data = b''  # Empty data for scan
     
     logger.debug(f"Scan packet: {scan}")
     sock_send(libnetat.sock, bytes(scan))
 
 
-def netat_send(atcmd: str):
+def netat_send_at(atcmd: str):
     """
     Send an AT command to the target device.
     
@@ -269,10 +473,13 @@ def netat_send(atcmd: str):
     global libnetat
     logger.info(f"Sending AT command: {atcmd}")
     
+    # Ensure proper termination
+    if not atcmd.endswith(AT_TERMINATOR):
+        atcmd += AT_TERMINATOR
+    
     cmd = WnbNetatCmd()
     libnetat.cookie = random_bytes(6)
-    cmd.cmd = WNB_NETAT_CMD_AT_REQ
-    cmd.len = struct.pack('>H', len(atcmd))
+    cmd.cmd = WnbCommand.AT_REQ
     cmd.dest = libnetat.dest
     cmd.src = libnetat.cookie
     cmd.data = atcmd.encode('utf-8')
@@ -281,102 +488,315 @@ def netat_send(atcmd: str):
     sock_send(libnetat.sock, bytes(cmd))
 
 
-def netat_recv(buff: Optional[bytearray], timeout: float) -> int:
+def netat_send_data(data: bytes, dest_mac: bytes = None):
+    """
+    Send data using AT+TXDATA protocol.
+    
+    Args:
+        data: Raw data to send
+        dest_mac: Destination MAC for 1-to-many mode
+    """
+    global libnetat
+    
+    if libnetat.mode == 'one-to-many' and dest_mac:
+        # Add Ethernet frame header
+        frame = EthernetFrame(dest_mac=dest_mac)
+        data = bytes(frame) + data
+        logger.debug(f"Added Ethernet frame header: {frame}")
+    
+    # Send using AT+TXDATA command
+    atcmd = f"AT+TXDATA={len(data)}"
+    netat_send_at(atcmd)
+    time.sleep(0.1)  # Wait for OK response
+    
+    # Send actual data
+    cmd = WnbNetatCmd()
+    cmd.cmd = WnbCommand.DATA_REQ
+    cmd.dest = libnetat.dest
+    cmd.src = libnetat.cookie
+    cmd.data = data
+    
+    sock_send(libnetat.sock, bytes(cmd))
+
+
+def parse_at_response(data: bytes) -> Dict[str, Any]:
+    """
+    Parse AT command response.
+    
+    Expected formats:
+    - +COMMAND:value
+    - OK
+    - ERROR
+    - +RXDATA:length\\r\\n<data>
+    """
+    try:
+        text = data.decode('utf-8', errors='ignore').strip()
+        result = {
+            'raw': text,
+            'success': False,
+            'command': None,
+            'value': None,
+            'data': None
+        }
+        
+        lines = text.split('\r\n')
+        for line in lines:
+            line = line.strip()
+            if line == 'OK':
+                result['success'] = True
+            elif line == 'ERROR':
+                result['success'] = False
+            elif line.startswith('+'):
+                # Parse +COMMAND:value format
+                if ':' in line:
+                    parts = line[1:].split(':', 1)
+                    result['command'] = parts[0]
+                    result['value'] = parts[1] if len(parts) > 1 else ''
+                    
+                    # Special handling for RXDATA
+                    if result['command'] == 'RXDATA':
+                        try:
+                            length = int(result['value'])
+                            # Data follows after the command line
+                            data_start = text.index('\r\n', text.index('+RXDATA')) + 2
+                            result['data'] = data[data_start:data_start+length]
+                        except:
+                            pass
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error parsing AT response: {e}")
+        return {'raw': data.hex(), 'success': False}
+
+
+def netat_recv(timeout: float = 2.0) -> Optional[Dict[str, Any]]:
     """
     Receive and process responses from HaLow devices.
     
     Args:
-        buff: Buffer to store received data (None to print directly)
         timeout: Timeout in seconds to wait for response
     
     Returns:
-        Number of bytes received
+        Parsed response dictionary or None
     """
     global libnetat
-    off = 0
-    cmd = WnbNetatCmd()
+    responses = []
+    start_time = time.time()
     
-    logger.debug(f"Waiting for response (timeout={timeout}s)")
-    
-    while True:
-        data, addr = sock_recv(libnetat.sock, timeout)
-        if data:
-            cmd_len = len(data)
-            logger.debug(f"Processing {cmd_len} bytes from {addr}")
-            
-            if cmd_len >= 15:  # Minimum packet size (header without data)
-                cmd_bytes = bytearray(data)
-                cmd.cmd = cmd_bytes[0]
-                cmd.len = cmd_bytes[1:3]
-                cmd.dest = bytes(cmd_bytes[3:9])
-                cmd.src = bytes(cmd_bytes[9:15])
-                cmd.data = bytes(cmd_bytes[15:]) if cmd_len > 15 else b''
-                
-                logger.debug(f"Parsed packet: {cmd}")
-                logger.debug(f"Checking cookie match: {cmd.dest.hex()} == {libnetat.cookie.hex()}")
-                
-                if cmd.dest == libnetat.cookie:
-                    logger.info(f"Received matching response (cmd={cmd.cmd})")
-                    
-                    if cmd.cmd == WNB_NETAT_CMD_SCAN_RESP:
-                        libnetat.dest = cmd.src
-                        logger.info(f"Device found at MAC: {cmd.src.hex()}")
-                        
-                    elif cmd.cmd == WNB_NETAT_CMD_AT_RESP:
-                        logger.debug(f"AT response data: {cmd.data}")
-                        if buff is not None:
-                            # Store in buffer
-                            data_len = len(cmd.data)
-                            if off + data_len <= len(buff):
-                                buff[off:off + data_len] = cmd.data
-                                off += data_len
-                            else:
-                                logger.warning("Buffer overflow, truncating response")
-                                remaining = len(buff) - off
-                                buff[off:] = cmd.data[:remaining]
-                                off = len(buff)
-                        else:
-                            # Print directly
-                            try:
-                                response = cmd.data.decode('utf-8', errors='replace')
-                                print(response)
-                            except Exception as e:
-                                logger.error(f"Error decoding response: {e}")
-                                print(f"Raw response: {cmd.data.hex()}")
-                else:
-                    logger.debug(f"Cookie mismatch, ignoring packet")
-            else:
-                logger.warning(f"Packet too small ({cmd_len} bytes), ignoring")
-                break
-        else:
-            logger.debug("No more data to receive")
+    while time.time() - start_time < timeout:
+        remaining = timeout - (time.time() - start_time)
+        if remaining <= 0:
             break
+            
+        data, addr = sock_recv(libnetat.sock, remaining)
+        if data:
+            cmd = WnbNetatCmd.from_bytes(data)
+            if not cmd:
+                logger.warning(f"Invalid packet received: {data.hex()}")
+                continue
+            
+            logger.debug(f"Parsed packet: {cmd}")
+            
+            # Check if response matches our cookie
+            if cmd.dest == libnetat.cookie:
+                logger.info(f"Received matching response (cmd={WnbCommand(cmd.cmd).name if cmd.cmd in WnbCommand.__members__.values() else cmd.cmd})")
+                
+                if cmd.cmd == WnbCommand.SCAN_RESP:
+                    libnetat.dest = cmd.src
+                    logger.info(f"Device found at MAC: {':'.join(f'{b:02x}' for b in cmd.src)}")
+                    responses.append({'type': 'scan', 'mac': cmd.src.hex()})
+                    
+                elif cmd.cmd == WnbCommand.AT_RESP:
+                    response = parse_at_response(cmd.data)
+                    logger.info(f"AT response: {response}")
+                    responses.append(response)
+                    libnetat.last_response = response
+                    
+                    # Print formatted response
+                    if response.get('command'):
+                        print(f"+{response['command']}:{response.get('value', '')}")
+                    if response.get('success'):
+                        print("OK")
+                    elif 'ERROR' in response.get('raw', ''):
+                        print("ERROR")
+                    
+                elif cmd.cmd == WnbCommand.DATA_RESP:
+                    logger.info(f"Data response received: {len(cmd.data)} bytes")
+                    responses.append({'type': 'data', 'data': cmd.data})
+            else:
+                logger.debug(f"Cookie mismatch: {cmd.dest.hex()} != {libnetat.cookie.hex()}")
     
-    if buff and off > 0:
-        # Null-terminate the buffer
-        if off < len(buff):
-            buff[off] = 0
-        logger.info(f"Total received: {off} bytes")
+    return responses[0] if responses else None
+
+# ============================================================================
+# AT COMMAND HELPERS
+# ============================================================================
+
+class ATCommands:
+    """Common AT command shortcuts and helpers."""
     
-    return off
+    @staticmethod
+    def set_mode(mode: str) -> bool:
+        """Set device mode (ap/sta/group/apsta)."""
+        logger.info(f"Setting mode to {mode}")
+        netat_send_at(f"AT+MODE={mode}")
+        response = netat_recv()
+        return response and response.get('success')
+    
+    @staticmethod
+    def set_ssid(ssid: str) -> bool:
+        """Set SSID (max 32 characters)."""
+        if len(ssid) > 32:
+            logger.error("SSID too long (max 32 characters)")
+            return False
+        logger.info(f"Setting SSID to {ssid}")
+        netat_send_at(f"AT+SSID={ssid}")
+        response = netat_recv()
+        return response and response.get('success')
+    
+    @staticmethod
+    def set_encryption(mode: str) -> bool:
+        """Set encryption mode (WPA-PSK/NONE)."""
+        logger.info(f"Setting encryption to {mode}")
+        netat_send_at(f"AT+KEYMGMT={mode}")
+        response = netat_recv()
+        return response and response.get('success')
+    
+    @staticmethod
+    def set_password(psk: str) -> bool:
+        """Set encryption password (64 hex characters)."""
+        if len(psk) != 64:
+            logger.error("PSK must be exactly 64 hex characters")
+            return False
+        logger.info("Setting encryption password")
+        netat_send_at(f"AT+PSK={psk}")
+        response = netat_recv()
+        return response and response.get('success')
+    
+    @staticmethod
+    def set_bandwidth(bw: int) -> bool:
+        """Set BSS bandwidth (1/2/4/8 MHz)."""
+        if bw not in [1, 2, 4, 8]:
+            logger.error("Invalid bandwidth (must be 1, 2, 4, or 8)")
+            return False
+        logger.info(f"Setting bandwidth to {bw}MHz")
+        netat_send_at(f"AT+BSS_BW={bw}")
+        response = netat_recv()
+        return response and response.get('success')
+    
+    @staticmethod
+    def set_frequency_range(start: int, end: int) -> bool:
+        """Set frequency range (value = frequency * 10)."""
+        logger.info(f"Setting frequency range: {start/10}MHz - {end/10}MHz")
+        netat_send_at(f"AT+FREQ_RANGE={start},{end}")
+        response = netat_recv()
+        return response and response.get('success')
+    
+    @staticmethod
+    def get_rssi(index: int = None, mac: str = None) -> Optional[int]:
+        """Get RSSI value."""
+        if mac:
+            netat_send_at(f"AT+RSSI={mac}")
+        elif index:
+            netat_send_at(f"AT+RSSI={index}")
+        else:
+            netat_send_at("AT+RSSI")
+        
+        response = netat_recv()
+        if response and response.get('command') == 'RSSI':
+            try:
+                return int(response.get('value', '0'))
+            except:
+                pass
+        return None
+    
+    @staticmethod
+    def get_connection_state() -> str:
+        """Get connection state."""
+        netat_send_at("AT+CONN_STATE")
+        response = netat_recv()
+        if response:
+            if 'CONNECTED' in response.get('raw', ''):
+                return 'CONNECTED'
+            elif 'DISCONNECT' in response.get('raw', ''):
+                return 'DISCONNECTED'
+        return 'UNKNOWN'
+    
+    @staticmethod
+    def start_pairing() -> bool:
+        """Start pairing process."""
+        logger.info("Starting pairing")
+        netat_send_at("AT+PAIR=1")
+        response = netat_recv()
+        return response and response.get('success')
+    
+    @staticmethod
+    def stop_pairing() -> bool:
+        """Stop pairing process."""
+        logger.info("Stopping pairing")
+        netat_send_at("AT+PAIR=0")
+        response = netat_recv()
+        return response and response.get('success')
+    
+    @staticmethod
+    def quick_setup_ap(ssid: str, password: str = None, bandwidth: int = 8):
+        """Quick setup for AP mode."""
+        logger.info("Quick AP setup")
+        success = True
+        
+        # Set frequency range (908-924 MHz as example)
+        success &= ATCommands.set_frequency_range(9080, 9240)
+        
+        # Set bandwidth
+        success &= ATCommands.set_bandwidth(bandwidth)
+        
+        # Set SSID
+        success &= ATCommands.set_ssid(ssid)
+        
+        # Set encryption
+        if password:
+            success &= ATCommands.set_encryption("WPA-PSK")
+            # Convert password to 64 hex chars (simplified - should use proper PSK generation)
+            psk = password.encode().hex().ljust(64, '0')[:64]
+            success &= ATCommands.set_password(psk)
+        else:
+            success &= ATCommands.set_encryption("NONE")
+        
+        # Set mode
+        success &= ATCommands.set_mode("ap")
+        
+        return success
+    
+    @staticmethod
+    def quick_setup_sta(ssid: str, password: str = None):
+        """Quick setup for STA mode."""
+        logger.info("Quick STA setup")
+        success = True
+        
+        # Set SSID
+        success &= ATCommands.set_ssid(ssid)
+        
+        # Set encryption
+        if password:
+            success &= ATCommands.set_encryption("WPA-PSK")
+            # Convert password to 64 hex chars (simplified - should use proper PSK generation)
+            psk = password.encode().hex().ljust(64, '0')[:64]
+            success &= ATCommands.set_password(psk)
+        else:
+            success &= ATCommands.set_encryption("NONE")
+        
+        # Set mode
+        success &= ATCommands.set_mode("sta")
+        
+        return success
 
 # ============================================================================
 # INITIALIZATION FUNCTIONS
 # ============================================================================
 
 def bind_socket_linux(sock: socket.socket, ifname: str) -> bool:
-    """
-    Bind socket to interface on Linux systems.
-    
-    Args:
-        sock: Socket to bind
-        ifname: Interface name
-    
-    Returns:
-        True if successful, False otherwise
-    """
+    """Bind socket to interface on Linux systems."""
     try:
-        # Method 1: SO_BINDTODEVICE (requires root on Linux)
         logger.debug(f"Trying SO_BINDTODEVICE for interface {ifname}")
         req = struct.pack('16s', ifname.encode('utf-8'))
         sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, req)
@@ -386,23 +806,13 @@ def bind_socket_linux(sock: socket.socket, ifname: str) -> bool:
         logger.warning("SO_BINDTODEVICE requires root privileges")
     except Exception as e:
         logger.debug(f"SO_BINDTODEVICE failed: {e}")
-    
     return False
 
 
 def bind_socket_generic(sock: socket.socket, ifname: str) -> bool:
-    """
-    Generic socket binding method that works across platforms.
-    
-    Args:
-        sock: Socket to bind
-        ifname: Interface name or IP address
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    # Method 2: Try binding to specific IP if provided
-    if '.' in ifname:  # Looks like an IP address
+    """Generic socket binding method that works across platforms."""
+    # Try binding to specific IP if provided
+    if '.' in ifname:
         try:
             logger.debug(f"Binding to IP address: {ifname}")
             sock.bind((ifname, NETAT_PORT))
@@ -412,7 +822,7 @@ def bind_socket_generic(sock: socket.socket, ifname: str) -> bool:
             logger.error(f"Failed to bind to {ifname}: {e}")
             return False
     
-    # Method 3: Get IP from interface name
+    # Get IP from interface name
     try:
         import netifaces
         logger.debug(f"Looking up IP for interface {ifname}")
@@ -433,20 +843,12 @@ def bind_socket_generic(sock: socket.socket, ifname: str) -> bool:
 
 
 def libnetat_init(ifname: str, allow_any: bool = False) -> int:
-    """
-    Initialize the AT command manager with network configuration.
-    
-    Args:
-        ifname: Network interface name or IP address
-        allow_any: If True, bind to any interface if specific binding fails
-    
-    Returns:
-        0 on success, -1 on failure
-    """
+    """Initialize the AT command manager with network configuration."""
     global libnetat
     
     logger.info("="*60)
-    logger.info("Initializing HaLow AT command interface")
+    logger.info("HaLow AT Command Interface v4.0")
+    logger.info("="*60)
     logger.info(f"Platform: {get_platform_info()}")
     logger.info(f"Interface: {ifname}")
     logger.info("="*60)
@@ -464,7 +866,7 @@ def libnetat_init(ifname: str, allow_any: bool = False) -> int:
         logger.debug("Enabling broadcast mode")
         libnetat.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
-        # Set socket to non-blocking for better control
+        # Set socket to non-blocking
         libnetat.sock.setblocking(False)
         
         # Platform-specific binding
@@ -472,19 +874,16 @@ def libnetat_init(ifname: str, allow_any: bool = False) -> int:
         system = platform.system()
         
         if system == 'Linux':
-            # Try Linux-specific binding first
             bound = bind_socket_linux(libnetat.sock, ifname)
             if bound:
                 libnetat.bind_method = "SO_BINDTODEVICE"
         
         if not bound:
-            # Try generic binding
             bound = bind_socket_generic(libnetat.sock, ifname)
             if bound:
                 libnetat.bind_method = "IP_BINDING"
         
         if not bound and allow_any:
-            # Fall back to binding to any interface
             logger.warning(f"Could not bind to {ifname}, binding to all interfaces")
             try:
                 libnetat.sock.bind(('0.0.0.0', NETAT_PORT))
@@ -505,18 +904,18 @@ def libnetat_init(ifname: str, allow_any: bool = False) -> int:
             libnetat.sock.close()
             return -1
         
-        logger.info(f"Socket initialized successfully (method: {libnetat.bind_method})")
+        logger.info(f"Socket initialized (method: {libnetat.bind_method})")
         
         # Initial device scan
         logger.info("Performing initial device scan...")
         netat_scan()
-        netat_recv(None, 1)
+        netat_recv(1)
         
         if libnetat.dest[0] & 0x1:  # Still broadcast address
             logger.warning("No devices found in initial scan")
             logger.info("Device will be scanned when sending first command")
         else:
-            logger.info(f"Device detected: {libnetat.dest.hex()}")
+            logger.info(f"Device detected: {':'.join(f'{b:02x}' for b in libnetat.dest)}")
         
         return 0
         
@@ -528,15 +927,7 @@ def libnetat_init(ifname: str, allow_any: bool = False) -> int:
 
 
 def libnetat_send(atcmd: str) -> int:
-    """
-    Send an AT command and receive response.
-    
-    Args:
-        atcmd: AT command string to send
-    
-    Returns:
-        0 on success, -1 on failure
-    """
+    """Send an AT command and receive response."""
     global libnetat
     
     if libnetat.sock is None:
@@ -547,33 +938,176 @@ def libnetat_send(atcmd: str) -> int:
     if libnetat.dest[0] & 0x1:  # Broadcast/multicast address
         logger.info("Scanning for device...")
         netat_scan()
-        netat_recv(None, 1)
-    
-    if libnetat.dest[0] & 0x1:  # Still no device
-        logger.error("No HaLow device detected!")
-        logger.info("\nTroubleshooting:")
-        logger.info("1. Check if the HaLow module is powered on")
-        logger.info("2. Verify network connectivity")
-        logger.info("3. Ensure you're on the same network segment")
-        logger.info("4. Check firewall settings for UDP port 56789")
-        return -1
+        response = netat_recv(1)
+        
+        if not response or libnetat.dest[0] & 0x1:
+            logger.error("No HaLow device detected!")
+            logger.info("\nTroubleshooting:")
+            logger.info("1. Check if the HaLow module is powered on")
+            logger.info("2. Verify network connectivity")
+            logger.info("3. Ensure you're on the same network segment")
+            logger.info("4. Check firewall settings for UDP port 56789")
+            return -1
     
     # Send AT command
-    netat_send(atcmd)
+    netat_send_at(atcmd)
     
     # Receive response
-    response_buff = bytearray(1024)
-    bytes_received = netat_recv(response_buff, 2)
+    response = netat_recv(2)
     
-    if bytes_received > 0:
-        try:
-            response = response_buff[:bytes_received].decode('utf-8', errors='replace')
-            print(f"\nResponse:\n{response}")
-        except Exception as e:
-            logger.error(f"Error decoding response: {e}")
-            print(f"Raw response: {response_buff[:bytes_received].hex()}")
-    else:
+    if not response:
         logger.warning("No response received")
+    
+    return 0
+
+# ============================================================================
+# RAW PACKET MODE
+# ============================================================================
+
+def raw_packet_mode():
+    """Interactive raw packet mode for testing."""
+    global libnetat
+    
+    print("\n" + "="*60)
+    print("RAW PACKET MODE")
+    print("="*60)
+    print("Commands:")
+    print("  hex <data>    - Send raw hex data")
+    print("  cmd <c> <data> - Send with command byte")
+    print("  scan          - Send scan request")
+    print("  recv          - Receive packets")
+    print("  exit          - Exit raw mode")
+    print("="*60 + "\n")
+    
+    while True:
+        try:
+            cmd = input("RAW> ").strip()
+            
+            if not cmd:
+                continue
+            
+            if cmd == 'exit':
+                break
+            
+            elif cmd == 'scan':
+                netat_scan()
+                netat_recv(1)
+            
+            elif cmd == 'recv':
+                print("Receiving for 5 seconds...")
+                netat_recv(5)
+            
+            elif cmd.startswith('hex '):
+                hex_data = cmd[4:].replace(' ', '')
+                try:
+                    data = bytes.fromhex(hex_data)
+                    sock_send(libnetat.sock, data)
+                except ValueError:
+                    print("Invalid hex data")
+            
+            elif cmd.startswith('cmd '):
+                parts = cmd.split(' ', 2)
+                if len(parts) >= 2:
+                    try:
+                        cmd_byte = int(parts[1])
+                        data = parts[2].encode() if len(parts) > 2 else b''
+                        
+                        packet = WnbNetatCmd()
+                        packet.cmd = cmd_byte
+                        packet.dest = libnetat.dest
+                        packet.src = libnetat.cookie
+                        packet.data = data
+                        
+                        sock_send(libnetat.sock, bytes(packet))
+                    except ValueError:
+                        print("Invalid command byte")
+            
+            else:
+                print("Unknown command")
+                
+        except KeyboardInterrupt:
+            print("\nExiting raw mode")
+            break
+        except Exception as e:
+            logger.error(f"Error in raw mode: {e}")
+
+# ============================================================================
+# SERIAL PORT SUPPORT
+# ============================================================================
+
+def serial_mode(port: str, baudrate: int = 115200):
+    """Serial port mode for direct UART communication."""
+    try:
+        import serial
+    except ImportError:
+        logger.error("PySerial not installed. Install with: pip install pyserial")
+        return -1
+    
+    logger.info(f"Opening serial port {port} at {baudrate} baud")
+    
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            bytesize=8,
+            parity='N',
+            stopbits=1,
+            timeout=1,
+            rtscts=False,
+            dsrdtr=False
+        )
+        
+        # Set new line mode
+        ser.write(b'\r\n')
+        time.sleep(0.1)
+        
+        # Test with AT+
+        ser.write(b'AT+\r\n')
+        time.sleep(0.5)
+        response = ser.read(ser.in_waiting)
+        if response:
+            logger.info(f"Serial response: {response.decode('utf-8', errors='ignore')}")
+        
+        print("\n" + "="*60)
+        print(f"Serial Mode - {port} @ {baudrate}")
+        print("="*60)
+        print("Enter AT commands (e.g., 'AT+GMR')")
+        print("Type 'exit' to quit")
+        print("="*60 + "\n")
+        
+        # Start reader thread
+        def serial_reader():
+            while ser.is_open:
+                if ser.in_waiting:
+                    data = ser.read(ser.in_waiting)
+                    print(data.decode('utf-8', errors='ignore'), end='')
+                time.sleep(0.01)
+        
+        import threading
+        reader = threading.Thread(target=serial_reader, daemon=True)
+        reader.start()
+        
+        # Main loop
+        while True:
+            try:
+                cmd = input()
+                if cmd.lower() == 'exit':
+                    break
+                
+                # Send command with proper termination
+                if not cmd.endswith('\r\n'):
+                    cmd += '\r\n'
+                ser.write(cmd.encode())
+                
+            except KeyboardInterrupt:
+                break
+        
+        ser.close()
+        logger.info("Serial port closed")
+        
+    except Exception as e:
+        logger.error(f"Serial port error: {e}")
+        return -1
     
     return 0
 
@@ -583,7 +1117,7 @@ def libnetat_send(atcmd: str) -> int:
 
 def main():
     """Main entry point for the AT command tool."""
-    global libnetat
+    global libnetat, logger
     
     parser = argparse.ArgumentParser(
         description='AT Command Configuration Tool for Taixin TX-AH-R WiFi HaLow Modules',
@@ -595,6 +1129,19 @@ Examples:
   %(prog)s en0 --debug            # macOS with debug output
   %(prog)s wlan0 --any            # Allow fallback to any interface
   %(prog)s --list                 # List available interfaces
+  %(prog)s --serial COM3          # Use serial port (Windows)
+  %(prog)s --serial /dev/ttyUSB0  # Use serial port (Linux/Mac)
+  %(prog)s eth0 --raw             # Raw packet mode
+  %(prog)s eth0 --capture packets.json  # Capture packets
+  
+AT Command Examples:
+  AT+MODE?                # Query current mode
+  AT+MODE=ap              # Set AP mode
+  AT+SSID=test_network   # Set SSID
+  AT+KEYMGMT=NONE        # Disable encryption
+  AT+BSS_BW=8            # Set 8MHz bandwidth
+  AT+RSSI                # Get signal strength
+  AT+CONN_STATE          # Check connection
         """
     )
     
@@ -602,23 +1149,45 @@ Examples:
                         help='Network interface name or IP address')
     parser.add_argument('--debug', '-d', action='store_true',
                         help='Enable debug output')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Enable verbose packet logging')
     parser.add_argument('--any', '-a', action='store_true',
                         help='Allow binding to any interface if specific binding fails')
     parser.add_argument('--list', '-l', action='store_true',
                         help='List available network interfaces and exit')
     parser.add_argument('--timeout', '-t', type=float, default=2.0,
                         help='Response timeout in seconds (default: 2.0)')
+    parser.add_argument('--capture', '-c', metavar='FILE',
+                        help='Capture packets to file')
+    parser.add_argument('--raw', '-r', action='store_true',
+                        help='Enter raw packet mode')
+    parser.add_argument('--serial', '-s', metavar='PORT',
+                        help='Use serial port instead of network')
+    parser.add_argument('--baudrate', '-b', type=int, default=115200,
+                        help='Serial baudrate (default: 115200)')
+    parser.add_argument('--mode', '-m', choices=['one-to-one', 'one-to-many'],
+                        default='one-to-one',
+                        help='Communication mode (default: one-to-one)')
+    parser.add_argument('--quick-ap', metavar='SSID',
+                        help='Quick AP setup with SSID')
+    parser.add_argument('--quick-sta', metavar='SSID',
+                        help='Quick STA setup with SSID')
+    parser.add_argument('--password', '-p',
+                        help='Password for quick setup')
     
     args = parser.parse_args()
     
     # Setup logging
-    global logger
-    logger = setup_logging(args.debug)
+    logger = setup_logging(args.debug, args.verbose)
     
     # List interfaces if requested
     if args.list:
         list_network_interfaces()
         return 0
+    
+    # Serial mode
+    if args.serial:
+        return serial_mode(args.serial, args.baudrate)
     
     # Check interface argument
     if not args.interface:
@@ -627,18 +1196,45 @@ Examples:
         return -1
     
     # Initialize manager
-    libnetat = NetatMgr(debug=args.debug)
+    libnetat = NetatMgr(debug=args.debug, verbose=args.verbose)
+    libnetat.mode = args.mode
+    
+    # Start packet capture if requested
+    if args.capture:
+        libnetat.start_packet_capture(args.capture)
     
     # Initialize network
     if libnetat_init(args.interface, args.any) != 0:
         logger.error(f"Failed to initialize with interface: {args.interface}")
         return -1
     
+    # Quick setup modes
+    if args.quick_ap:
+        logger.info(f"Performing quick AP setup: {args.quick_ap}")
+        if ATCommands.quick_setup_ap(args.quick_ap, args.password):
+            logger.info("Quick AP setup successful")
+        else:
+            logger.error("Quick AP setup failed")
+        return 0
+    
+    if args.quick_sta:
+        logger.info(f"Performing quick STA setup: {args.quick_sta}")
+        if ATCommands.quick_setup_sta(args.quick_sta, args.password):
+            logger.info("Quick STA setup successful")
+        else:
+            logger.error("Quick STA setup failed")
+        return 0
+    
+    # Raw packet mode
+    if args.raw:
+        raw_packet_mode()
+        return 0
+    
     print("\n" + "="*60)
     print("HaLow AT Command Interface Ready")
     print("="*60)
     print("Enter AT commands (e.g., 'AT+GMR' for version)")
-    print("Type 'quit' or 'exit' to terminate")
+    print("Type 'help' for command list, 'quit' to exit")
     print("="*60 + "\n")
     
     # Main command loop
@@ -654,29 +1250,67 @@ Examples:
                 break
             
             if input_cmd.lower() == 'scan':
-                logger.info("Scanning for devices...")
                 netat_scan()
-                netat_recv(None, args.timeout)
+                netat_recv(args.timeout)
+                continue
+            
+            if input_cmd.lower() == 'raw':
+                raw_packet_mode()
                 continue
             
             if input_cmd.lower() == 'help':
                 print("\nAvailable commands:")
-                print("  AT+<cmd>  - Send AT command")
-                print("  scan      - Scan for HaLow devices")
-                print("  help      - Show this help")
-                print("  quit/exit - Exit the program")
+                print("  AT+<cmd>      - Send AT command")
+                print("  scan          - Scan for HaLow devices")
+                print("  raw           - Enter raw packet mode")
+                print("  rssi          - Get signal strength")
+                print("  status        - Get connection status")
+                print("  pair          - Start pairing")
+                print("  unpair        - Stop pairing")
+                print("  help          - Show this help")
+                print("  quit/exit     - Exit the program")
                 print("\nCommon AT commands:")
-                print("  AT+GMR    - Get module version")
-                print("  AT+RST    - Reset module")
-                print("  AT+CWMODE - Get/Set WiFi mode")
-                print("  AT+CWLAP  - List access points")
+                print("  AT+           - Test command")
+                print("  AT+MODE?      - Query mode")
+                print("  AT+MODE=ap/sta - Set mode")
+                print("  AT+SSID?      - Query SSID")
+                print("  AT+SSID=name  - Set SSID")
+                print("  AT+KEYMGMT?   - Query encryption")
+                print("  AT+PSK=hex    - Set password")
+                print("  AT+BSS_BW=8   - Set bandwidth")
+                print("  AT+RSSI       - Get signal")
+                print("  AT+CONN_STATE - Connection status")
+                print("  AT+WNBCFG     - View all config")
+                print("  AT+LOADDEF=1  - Factory reset")
+                continue
+            
+            # Shortcuts
+            if input_cmd.lower() == 'rssi':
+                rssi = ATCommands.get_rssi()
+                if rssi is not None:
+                    print(f"RSSI: {rssi} dBm")
+                continue
+            
+            if input_cmd.lower() == 'status':
+                state = ATCommands.get_connection_state()
+                print(f"Connection: {state}")
+                continue
+            
+            if input_cmd.lower() == 'pair':
+                if ATCommands.start_pairing():
+                    print("Pairing started")
+                continue
+            
+            if input_cmd.lower() == 'unpair':
+                if ATCommands.stop_pairing():
+                    print("Pairing stopped")
                 continue
             
             # Send AT command
             if input_cmd.upper().startswith("AT"):
                 libnetat_send(input_cmd)
             else:
-                print("Commands should start with 'AT'. Type 'help' for more info.")
+                print("Commands should start with 'AT' or use shortcuts. Type 'help' for more info.")
                 
         except KeyboardInterrupt:
             logger.info("\nInterrupted by user")
@@ -688,8 +1322,10 @@ Examples:
                 traceback.print_exc()
     
     # Cleanup
-    if libnetat and libnetat.sock:
-        libnetat.sock.close()
+    if libnetat:
+        libnetat.stop_packet_capture()
+        if libnetat.sock:
+            libnetat.sock.close()
     
     return 0
 

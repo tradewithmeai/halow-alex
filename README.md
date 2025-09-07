@@ -1,23 +1,26 @@
-# HaLow AT Command Configuration Tool
+# HaLow AT Command Configuration Tool v4.0
 
-AT command configuration app for Taixin TX-AH-R WiFi HaLow Modules/devices
+Advanced AT command configuration app for Taixin TX-AH-R WiFi HaLow Modules/devices with comprehensive debugging, packet analysis, and reverse engineering capabilities.
 
-## Overview
-This tool enables communication with WiFi HaLow (802.11ah) modules using AT commands over UDP broadcast protocol. It provides a command-line interface for configuring and controlling HaLow modules.
+## 🚀 New Features in v4.0
 
-## Features
-- Cross-platform support (Linux, macOS, Windows)
-- Multiple network binding methods
-- Comprehensive debugging and logging
-- Automatic device discovery via broadcast
-- Interactive AT command interface
-- Detailed error messages and troubleshooting
+- **📡 Packet Analysis Mode** - Detailed hex dumps and protocol inspection
+- **🔧 Raw Packet Mode** - Direct packet crafting and testing
+- **📊 Packet Capture** - Save all communications for analysis
+- **🎯 Serial Port Support** - Direct UART communication fallback
+- **⚡ Quick Setup Commands** - Instant AP/STA configuration
+- **🔍 Verbose Debugging** - Comprehensive packet-level logging
+- **💡 AT Command Helpers** - Built-in shortcuts for common operations
+- **🌈 Colored Terminal Output** - Enhanced readability
 
-## Installation
+## 📖 Overview
+This tool enables communication with WiFi HaLow (802.11ah) modules using AT commands over UDP broadcast protocol OR serial UART. Based on the manufacturer's protocol specification, it provides multiple communication methods with extensive debugging capabilities for troubleshooting and reverse engineering.
+
+## ⚙️ Installation
 
 ### Prerequisites
 - Python 3.6 or higher
-- Network interface connected to HaLow module
+- Network interface connected to HaLow module OR serial connection
 
 ### Basic Installation
 ```bash
@@ -27,99 +30,198 @@ python pylibnetat.py --help
 ```
 
 ### Optional Dependencies
-For better network interface discovery:
+For enhanced functionality:
 ```bash
+# Network interface discovery
 pip install netifaces
+
+# Serial port communication
+pip install pyserial
 ```
 
-## Usage
+## 🎮 Usage Examples
 
-### Quick Start
+### Quick Start Commands
 ```bash
 # List available network interfaces
 python pylibnetat.py --list
 
-# Connect using interface name
-python pylibnetat.py eth0
+# Basic connection with debug output
+python pylibnetat.py en7 --debug --verbose
 
-# Connect using IP address
-python pylibnetat.py 192.168.1.100
+# Quick AP setup
+python pylibnetat.py en7 --quick-ap "MyHaLowAP" --password "mypassword"
 
-# Connect with debug output
-python pylibnetat.py eth0 --debug
+# Serial port mode
+python pylibnetat.py --serial /dev/ttyUSB0
 
-# Allow fallback to any interface
-python pylibnetat.py eth0 --any
+# Raw packet analysis mode
+python pylibnetat.py en7 --raw --capture packets.json
 ```
+
+### Network Communication
+```bash
+# Interface binding (macOS/Linux)
+python pylibnetat.py en7 --debug
+
+# IP address binding (all platforms)
+python pylibnetat.py 192.168.1.100 --debug
+
+# Fallback to any interface
+python pylibnetat.py en7 --any --verbose
+
+# Packet capture for analysis
+python pylibnetat.py en7 --capture debug.json --verbose
+```
+
+### Serial Communication
+```bash
+# Windows
+python pylibnetat.py --serial COM3 --baudrate 115200
+
+# Linux/macOS
+python pylibnetat.py --serial /dev/ttyUSB0 --baudrate 115200
+```
+
+## 📋 Command Reference
 
 ### Command-Line Options
 - `interface` - Network interface name or IP address
-- `--debug, -d` - Enable detailed debug output
+- `--debug, -d` - Enable debug output
+- `--verbose, -v` - Enable verbose packet logging with hex dumps
 - `--any, -a` - Allow binding to any interface if specific binding fails
 - `--list, -l` - List available network interfaces
 - `--timeout, -t` - Response timeout in seconds (default: 2.0)
+- `--capture, -c FILE` - Capture all packets to JSON file
+- `--raw, -r` - Enter raw packet mode for testing
+- `--serial, -s PORT` - Use serial port instead of network
+- `--baudrate, -b` - Serial port baud rate (default: 115200)
+- `--mode, -m` - Communication mode: one-to-one/one-to-many
+- `--quick-ap SSID` - Quick AP setup with specified SSID
+- `--quick-sta SSID` - Quick STA setup with specified SSID  
+- `--password, -p` - Password for quick setup
 
 ### Interactive Commands
-Once connected, you can use:
+Once connected:
 - `AT+<cmd>` - Send AT command to module
 - `scan` - Scan for HaLow devices
-- `help` - Show available commands
+- `raw` - Enter raw packet mode
+- `rssi` - Get signal strength quickly
+- `status` - Get connection status
+- `pair` - Start pairing process
+- `unpair` - Stop pairing process
+- `help` - Show command help
 - `quit/exit` - Exit the program
 
 ### Common AT Commands
-- `AT+GMR` - Get module firmware version
-- `AT+RST` - Reset module
-- `AT+CWMODE` - Get/Set WiFi mode
-- `AT+CWLAP` - List available access points
-- `AT+CWJAP` - Join access point
-- `AT+CIFSR` - Get IP address
+Based on manufacturer documentation:
 
-## Testing Instructions for Your Friend
+#### Basic Configuration
+- `AT+` - Test command (should echo back)
+- `AT+MODE?` - Query current mode
+- `AT+MODE=ap/sta/group/apsta` - Set operating mode
+- `AT+SSID?` - Query current SSID
+- `AT+SSID=network_name` - Set SSID (max 32 chars)
+- `AT+KEYMGMT?` - Query encryption mode
+- `AT+KEYMGMT=WPA-PSK/NONE` - Set encryption mode
+- `AT+PSK=<64_hex_chars>` - Set WPA password (64 hex characters)
 
-### 1. Initial Setup
+#### Network Settings
+- `AT+BSS_BW=1/2/4/8` - Set bandwidth (MHz)
+- `AT+FREQ_RANGE=start,end` - Set frequency range (freq*10)
+- `AT+CHAN_LIST=freq1,freq2,...` - Set specific frequency list
+- `AT+TXPOWER=6-20` - Set transmit power (dBm)
+- `AT+ACKTMO=value` - Set ACK timeout (microseconds)
+
+#### Status & Control
+- `AT+RSSI` - Get signal strength
+- `AT+RSSI=index/mac_addr` - Get RSSI from specific device
+- `AT+CONN_STATE` - Get connection status
+- `AT+WNBCFG` - View all device configuration
+- `AT+PAIR=1/0` - Start/stop pairing mode
+
+#### Data Transmission
+- `AT+TXDATA=length[,bw,mcs,priority]` - Send data command
+- `AT+JOINGROUP=mac_addr,AID` - Join multicast group
+
+#### Advanced/Debug
+- `AT+FWUPG` - Enter firmware upgrade mode
+- `AT+LOADDEF=1` - Factory reset
+- `AT+ROAM=0/1` - Enable/disable roaming
+
+## 🧪 Testing Instructions for Remote Debugging
+
+### Method 1: Network Interface Testing
 ```bash
-# Clone the repository
-git clone https://github.com/tradewithmeai/halow-alex.git
-cd halow-alex
-
-# Install optional dependencies (recommended)
-pip install netifaces
-```
-
-### 2. Find the Correct Network Interface
-```bash
-# List all network interfaces
+# Step 1: List interfaces
 python pylibnetat.py --list
 
-# On macOS, interfaces are usually: en0, en1, en7, etc.
-# On Linux: eth0, wlan0, etc.
-# On Windows: use IP address instead
+# Step 2: Try direct IP binding with full debug
+python pylibnetat.py 192.168.1.100 --debug --verbose --capture debug.json
+
+# Step 3: Try interface with fallback
+python pylibnetat.py en7 --any --debug --verbose
+
+# Step 4: Test basic AT commands
+> AT+
+> AT+MODE?
+> AT+WNBCFG
 ```
 
-### 3. Test Connection Methods
-
-#### Method A: Direct Interface Binding (macOS/Linux)
+### Method 2: Serial Port Testing
 ```bash
-# Try with the interface that's connected to the HaLow module
-python pylibnetat.py en7 --debug
+# Step 1: Find serial ports
+# macOS: ls /dev/tty.*
+# Linux: ls /dev/ttyUSB* /dev/ttyACM*
+# Windows: Check Device Manager
+
+# Step 2: Connect via serial
+python pylibnetat.py --serial /dev/ttyUSB0 --debug
+
+# Step 3: Test basic commands
+AT+
+AT+MODE?
+AT+SSID?
 ```
 
-#### Method B: IP Address Binding (All Platforms)
+### Method 3: Raw Packet Analysis
 ```bash
-# Find your IP address on the network with the HaLow module
-# Then use it directly
-python pylibnetat.py 192.168.1.100 --debug
+# Step 1: Start in raw mode with capture
+python pylibnetat.py en7 --raw --capture raw_packets.json --verbose
+
+# Step 2: Send different packet types
+RAW> scan
+RAW> hex 0100000000000000000000000000000000000000
+RAW> cmd 1 
+RAW> recv
+
+# Step 3: Analyze captured packets
+# Check the JSON file for packet structure
 ```
 
-#### Method C: Any Interface Binding (Fallback)
+### Method 4: Protocol Reverse Engineering
 ```bash
-# This binds to all interfaces (0.0.0.0)
-python pylibnetat.py en7 --any --debug
+# Capture all traffic for analysis
+python pylibnetat.py en7 --capture full_session.json --verbose --debug
+
+# Run commands and analyze responses
+> scan
+> AT+
+> AT+MODE?
+> AT+WNBCFG
+
+# The JSON file will contain:
+# - Packet timestamps
+# - Direction (TX/RX)
+# - Hex dumps of all data
+# - Parsed packet analysis
 ```
 
-### 4. Troubleshooting Steps
+## 🔧 Troubleshooting Guide
 
-If you get "Protocol not available" error:
+### Common Issues and Solutions
+
+#### "Protocol not available" Error
 1. **Use IP address instead of interface name**
    ```bash
    python pylibnetat.py 192.168.1.100 --debug
@@ -130,71 +232,189 @@ If you get "Protocol not available" error:
    python pylibnetat.py en7 --any --debug
    ```
 
+3. **Use serial port as fallback**
+   ```bash
+   python pylibnetat.py --serial /dev/ttyUSB0
+   ```
+
+#### No Device Found
+1. **Check power and connections**
+   - Ensure HaLow module is powered on
+   - Verify network cable connections
+
+2. **Check network configuration**
+   - Ensure same network segment
+   - Test with: `ping <module_ip>`
+
 3. **Check firewall settings**
-   - Ensure UDP port 56789 is not blocked
-   - On macOS: System Preferences → Security & Privacy → Firewall
-   - On Linux: `sudo ufw allow 56789/udp`
+   - Allow UDP port 56789
+   - macOS: System Preferences → Security & Privacy → Firewall
+   - Linux: `sudo ufw allow 56789/udp`
+   - Windows: Windows Defender Firewall
 
-4. **Verify network connectivity**
+4. **Try different interfaces**
    ```bash
-   # Check if you can ping the HaLow module
-   ping <module_ip>
-   
-   # Check if port is already in use
-   netstat -an | grep 56789
+   python pylibnetat.py --list
+   # Try each interface listed
    ```
 
-5. **Run with elevated privileges (Linux only)**
+#### No Response to AT Commands
+1. **Enable verbose logging**
    ```bash
-   sudo python pylibnetat.py eth0 --debug
+   python pylibnetat.py en7 --debug --verbose
    ```
 
-### 5. Debug Output Analysis
-With `--debug` flag, you'll see:
-- Platform information
-- Socket binding attempts and methods
-- Packet transmission details (hex dumps)
-- Response parsing information
-- Cookie matching for request/response correlation
+2. **Try basic test command**
+   ```bash
+   > AT+
+   # Should receive echo response
+   ```
 
-### 6. Expected Behavior
-1. **Successful connection:**
-   - "Socket initialized successfully" message
-   - "HaLow AT Command Interface Ready" prompt
-   - Can type AT commands
+3. **Check packet capture**
+   ```bash
+   python pylibnetat.py en7 --capture debug.json --verbose
+   # Examine JSON file for actual packets sent/received
+   ```
 
-2. **Device found:**
-   - "Device found at MAC: xxxxxxxxxxxx" message
-   - AT commands receive responses
+4. **Use raw packet mode**
+   ```bash
+   > raw
+   RAW> scan
+   RAW> recv
+   # Look for any response packets
+   ```
 
-3. **No device found:**
-   - "No devices found in initial scan" warning
-   - Commands will trigger automatic scanning
+### Debug Output Analysis
 
-### 7. Network Requirements
-- HaLow module and computer must be on same network segment
-- UDP broadcast must be enabled on the network
-- Port 56789 must be available and not blocked
+#### Successful Connection
+Look for these messages:
+```
+Socket initialized (method: IP_BINDING)
+Device found at MAC: xx:xx:xx:xx:xx:xx
++COMMAND:value
+OK
+```
 
-### 8. Report Issues
-If problems persist, please provide:
-1. Complete output with `--debug` flag
-2. Operating system and version
-3. Network configuration (interface name, IP)
-4. HaLow module model and firmware version (if known)
+#### Network Issues
+```
+Failed to bind to interface
+No devices found in initial scan
+No response received
+```
 
-## Protocol Details
-- **Port:** UDP 56789
-- **Discovery:** UDP broadcast scan
-- **Packet Format:**
-  - Command byte (1)
-  - Length (2 bytes, big-endian)
-  - Destination MAC (6 bytes)
-  - Source MAC/Cookie (6 bytes)
-  - Data payload (variable)
+#### Protocol Issues
+```
+Invalid packet received
+Cookie mismatch
+Error parsing AT response
+```
 
-## License
+## 📊 Packet Analysis
+
+### Packet Structure
+Based on manufacturer documentation:
+```
+Packet Format (15+ bytes):
++-----+-----+-----+-----+-----+-----+
+| CMD | LEN | DEST MAC  |  SRC MAC  | DATA...
++-----+-----+-----+-----+-----+-----+
+  1     2        6           6       variable
+
+CMD: 1=SCAN_REQ, 2=SCAN_RESP, 3=AT_REQ, 4=AT_RESP
+LEN: Data length (big-endian)
+DEST: Destination MAC (6 bytes)
+SRC: Source MAC/Cookie (6 bytes)  
+DATA: AT command or response
+```
+
+### Hex Dump Example
+```
+============================================================
+Packet Analysis (Total: 23 bytes)
+============================================================
+CMD:  0x03 (AT_REQ)
+LEN:  0x0008 (8 bytes)
+DEST: ffffffffffff (ff:ff:ff:ff:ff:ff)
+SRC:  a1b2c3d4e5f6 (a1:b2:c3:d4:e5:f6)
+
+DATA (8 bytes):
+  0000: 41 54 2b 4d 4f 44 45 3f                         |AT+MODE?|
+
+Decoded: AT+MODE?
+============================================================
+```
+
+## 🛡️ Security Notes
+
+- This tool is for legitimate device configuration only
+- AT commands can modify device settings permanently
+- Use `AT+LOADDEF=1` to restore factory defaults if needed
+- Packet capture files may contain sensitive configuration data
+- Serial connections may require appropriate permissions
+
+## 📁 File Structure
+
+```
+halow-alex/
+├── pylibnetat.py          # Main application (v4.0)
+├── README.md              # This documentation
+├── LICENSE                # License file
+└── examples/              # Example configurations
+    ├── debug.json         # Sample packet capture
+    └── setup_scripts/     # Automated setup examples
+```
+
+## 🔄 Protocol Compatibility
+
+This implementation is based on:
+- Taixin TX-AH-R WiFi HaLow module documentation
+- Network AT command protocol (UDP port 56789)
+- Serial UART protocol (115200 baud, 8N1)
+- Manufacturer's netat.exe equivalent functionality
+
+## 📝 Version History
+
+### v4.0 (Latest)
+- Added comprehensive packet analysis and debugging
+- Implemented raw packet mode for protocol testing
+- Added serial port communication support
+- Enhanced AT command parsing and response handling
+- Added packet capture functionality
+- Implemented Ethernet frame support for data transmission
+- Added colored terminal output and verbose logging
+- Created AT command helper shortcuts
+
+### v3.0 (Previous)
+- Fixed cross-platform socket binding issues
+- Added multiple network interface binding methods
+- Improved error handling and debugging output
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Test your changes thoroughly
+4. Submit a pull request with detailed description
+
+## 📞 Support
+
+For issues and questions:
+1. Check the troubleshooting section above
+2. Enable `--debug --verbose` and capture output
+3. Use `--capture` to save packet traces
+4. Open an issue at https://github.com/tradewithmeai/halow-alex
+
+Include in your report:
+- Operating system and version
+- Python version
+- Full command line used
+- Complete debug output
+- Packet capture file (if available)
+
+## 📄 License
+
 See LICENSE file for details.
 
-## Contributing
-Issues and pull requests welcome at https://github.com/tradewithmeai/halow-alex
+---
+
+*This tool provides the functionality equivalent to the manufacturer's netat.exe but with enhanced debugging, analysis, and cross-platform support for WiFi HaLow module configuration.*
