@@ -7,7 +7,9 @@
       "Bash(git commit:*)",
       "Bash(gh repo create:*)",
       "Bash(git push:*)",
-      "Read(//c/Users/richw/Downloads/**)"
+      "Read(//c/Users/richw/Downloads/**)",
+      "Bash(mkdir:*)",
+      "Bash(python:*)"
     ],
     "deny": [],
     "ask": []
